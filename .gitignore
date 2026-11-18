@@ -1,3 +1,5 @@
 /target/
 /dist/
 /.openidea/
+# Signed packages live in the GitHub release, not in git.
+*.oiplugin

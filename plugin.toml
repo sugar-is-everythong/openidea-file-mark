@@ -1,9 +1,10 @@
-id = "openidea.file-marks"
+id = "sugar-is-everythong.file-marks"
 name = "File Marks 文件标记"
 version = "0.1.0"
 description = "Write a note after a file's name in the project tree, and list the notes per project. 在项目树的文件名后写备注，并按项目汇总列出所有备注。"
-authors = ["OpenIDEA contributors"]
+authors = ["sugar-is-everythong"]
 license = "Apache-2.0"
+categories = ["tools"]
 engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-command:*", "on-view:file-marks"]

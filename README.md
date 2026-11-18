@@ -50,10 +50,16 @@ mv sdk/sdk/rust/openidea-plugin sdk/openidea-plugin && rm -rf sdk/sdk
 From the repository root, build and test:
 
 ```sh
-plugins/build.sh plugins/community/file-marks
-cargo test --manifest-path plugins/community/file-marks/Cargo.toml
+cargo build --locked --release --target wasm32-wasip2
+cp target/wasm32-wasip2/release/openidea_plugin_openidea_file_marks.wasm dist/plugin.wasm
+cargo test
 ```
 
-Install it through Settings › Plugins › Install from Disk — the plugin folder, or
-a `.zip` of it (`plugin.toml` and `dist/plugin.wasm` at the root, `target/` and
-`sdk/` left out). See the [plugin guide](../../README.md).
+The component lands in `dist/plugin.wasm`, which is gitignored but must exist
+before packaging.
+
+Install it through Settings › Plugins › Install from Disk — the plugin folder, a
+`.zip` of it (`plugin.toml` and `dist/plugin.wasm` at the root, `target/` and
+`sdk/` left out), or the signed
+`sugar-is-everythong.file-marks-0.1.0.oiplugin` from a release.
+See the [plugin guide](https://github.com/l0ng-ai/openidea/blob/main/plugins/README.md).
