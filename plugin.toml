@@ -1,0 +1,49 @@
+id = "openidea.file-marks"
+name = "File Marks 文件标记"
+version = "0.1.0"
+description = "Write a note after a file's name in the project tree, and list the notes per project. 在项目树的文件名后写备注，并按项目汇总列出所有备注。"
+authors = ["OpenIDEA contributors"]
+license = "Apache-2.0"
+engines.openidea = "^1.10"
+wasm = "dist/plugin.wasm"
+activation = ["on-command:*", "on-view:file-marks"]
+
+[capabilities]
+required = ["project.read", "storage"]
+
+[[contributes.commands]]
+id = "add-remark"
+title = "Add Remark…"
+category = "File Marks"
+
+[[contributes.commands]]
+id = "clear-mark"
+title = "Clear"
+category = "File Marks"
+
+# Both entries of this plugin name the same `submenu`, so they are collected
+# under it. The plugin API this IDE implements has no `group`, so there is no
+# line between them and clearing sits right under the remark.
+[[contributes.menus]]
+menu = "projectView.context"
+command = "add-remark"
+submenu = "File Marks"
+
+[[contributes.menus]]
+menu = "projectView.context"
+command = "clear-mark"
+submenu = "File Marks"
+
+# The tool window lists every project, so its rows carry a `mark:` key and only
+# a row can be cleared from here; a folder shown for structure has a `dir:` key.
+[[contributes.menus]]
+menu = "viewItem.context"
+view = "file-marks"
+command = "clear-mark"
+when = "viewItemKind == \"mark\""
+
+[[contributes.views]]
+id = "file-marks"
+title = "File Marks"
+icon = "tag"
+location = "left"

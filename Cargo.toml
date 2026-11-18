@@ -1,0 +1,28 @@
+[package]
+name = "openidea-plugin-openidea-file-marks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A plugin builds on its own (target wasm32-wasip2), outside any IDE workspace.
+# The SDK vendored below has a workspace of its own; without this it would be
+# taken for a member of this one, and cargo refuses two roots in one workspace.
+[workspace]
+exclude = ["sdk/openidea-plugin"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The SDK of the release this plugin runs on, vendored from that tag: a
+# component built against a newer WIT is refused by an older IDE.
+#   git archive <tag> sdk/rust/openidea-plugin | tar -x -C sdk
+# then move it to sdk/openidea-plugin to refresh it for another release.
+openidea-plugin = { path = "sdk/openidea-plugin" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
