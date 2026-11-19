@@ -1,7 +1,7 @@
 id = "sugar-is-everythong.file-marks"
 name = "File Marks 文件标记"
-version = "0.1.0"
-description = "Write a note after a file's name in the project tree, and list the notes per project. 在项目树的文件名后写备注，并按项目汇总列出所有备注。"
+version = "0.1.1"
+description = "文件树标注。Notes on the project tree. 在项目树的文件名后面写一句备注，所有备注在 File Marks 窗口按项目汇总列出；备注只存进项目根目录的 file-mark.json，这是本插件唯一写的文件——写成项目里的文件是为了多人开发：提交进仓库全组看到同一份，换台机器 clone 就带走，也能手改、可以 .gitignore。A note after a file's name in the project tree, every note listed per project in the File Marks window; notes live in the project's own file-mark.json, the only file this plugin writes — keeping them in the project is what makes them shared: commit them and the whole team reads the same remarks, clone elsewhere and they travel."
 authors = ["sugar-is-everythong"]
 license = "Apache-2.0"
 categories = ["tools"]
@@ -10,7 +10,7 @@ wasm = "dist/plugin.wasm"
 activation = ["on-command:*", "on-view:file-marks"]
 
 [capabilities]
-required = ["project.read", "storage"]
+required = ["project.read", "project.write"]
 
 [[contributes.commands]]
 id = "add-remark"

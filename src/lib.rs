@@ -1,8 +1,11 @@
 //! File Marks: write a note after a file's name in the project tree.
 //!
-//! One mark is one line of text on one path, kept per project. The `file-marks`
-//! tool window lists every mark of every open project, narrowed by a word and
-//! shown either top to bottom or along the file structure.
+//! One mark is one line of text on one path. A project's notes are kept in
+//! `file-mark.json` at its root, so they sit with the code they describe: they
+//! can be committed, ignored, or edited by hand, and they come back with a
+//! clone. The `file-marks` tool window lists every mark of every open project,
+//! narrowed by a word and shown either top to bottom or along the file
+//! structure.
 //!
 //! A mark is the note only. The tree of the IDE this plugin runs against keeps
 //! one decoration record per file per plugin, and each call writes a whole one,
@@ -12,18 +15,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use openidea_plugin::{
-    host,
-    host::storage,
-    register_plugin,
+    host, register_plugin,
     views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views},
-    Context, Error, FileKind, Invocation, Plugin, Project,
+    Context, Error, FileKind, FileStat, Invocation, Plugin, Project,
 };
+use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 /// The set a mark is drawn with.
 const SET: &str = "file-marks";
 const VIEW: &str = "file-marks";
-/// `fm:<project root>:<path relative to that root>`; the value is the remark.
-const KEY_PREFIX: &str = "fm:";
+/// Where a project keeps its notes: this file, at its root.
+const FILE: &str = "file-mark.json";
+/// The shape of that file, written into it, so one made by a newer plugin is
+/// refused rather than rewritten with only what this version understands.
+const LAYOUT: u32 = 1;
 /// Tool-window rows are keyed `kind:path`: the IDE reads the kind back as the
 /// `viewItemKind` context key and passes the whole key as a command argument. A
 /// folder shown only to hold the structure is the other kind, so its menu has
@@ -51,7 +59,8 @@ register_plugin!(FileMarks, views);
 
 impl Plugin for FileMarks {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
-        // Marks do not survive a restart, so rebuild them from storage.
+        // The notes are in the project's file; what a restart loses is the
+        // drawing, so that is all there is to put back.
         refresh()
     }
 
@@ -145,9 +154,13 @@ impl Views for FileMarks {
 impl FileMarks {
     /// Writes one remark on every path the call names, answering with what the
     /// first of them already said so a single file is edited rather than replaced.
+    ///
+    /// The file is read before the box opens: notes that cannot be written back
+    /// should not be asked for in the first place.
     fn add_remark(&mut self, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
         let (project, paths) = targets(ctx, arg)?;
-        let current = remark(&project, &paths[0])?;
+        let mut book = Book::load(&project)?;
+        let current = book.remark(&project, &paths[0]);
         let Some(text) = host::input("Remark for this file or folder:", Some(&current))? else {
             return Ok(None);
         };
@@ -156,10 +169,11 @@ impl FileMarks {
             return Err(Error::Invalid(format!("a remark is at most {MAX_REMARK} characters")));
         }
         for path in &paths {
-            save(&project, path, &text)?;
+            book.put(&rel_name(&project, path), &text);
         }
+        book.save(&project)?;
         let named = named(&project, &paths);
-        refresh()?;
+        redraw(Some((&project, &book)))?;
         Ok(Some(if text.is_empty() {
             format!("Took the remark off {named}.")
         } else {
@@ -167,18 +181,21 @@ impl FileMarks {
         }))
     }
 
-    /// Takes the mark off every path the call names.
+    /// Takes the mark off every path the call names. A project with nothing to
+    /// take off is left without its file being touched, or made.
     fn clear(&mut self, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
         let (project, paths) = targets(ctx, arg)?;
+        let mut book = Book::load(&project)?;
         let mut cleared = 0;
         for path in &paths {
-            if remark(&project, path)?.is_empty() {
-                continue;
+            if book.put(&rel_name(&project, path), "") {
+                cleared += 1;
             }
-            storage::delete(&storage_key(&project, path)?)?;
-            cleared += 1;
         }
-        refresh()?;
+        if cleared > 0 {
+            book.save(&project)?;
+        }
+        redraw(Some((&project, &book)))?;
         let named = named(&project, &paths);
         Ok(Some(if cleared == 0 {
             format!("{named} carries no mark.")
@@ -193,6 +210,78 @@ impl FileMarks {
     }
 }
 
+/// What one project keeps: each marked path, as it reads from the root, and the
+/// note to write after its name.
+#[derive(Deserialize, Serialize)]
+struct Book {
+    /// [`LAYOUT`], so a file this plugin would write shorter is refused instead.
+    version: u32,
+    /// Path to note, sorted: a written file then diffs one line per change.
+    marks: BTreeMap<String, String>,
+}
+
+impl Book {
+    /// The project's file. Having no file yet is having no marks; a file that
+    /// cannot be read, or not read as this shape, is the error, and an error is
+    /// never written over — a note lost to one bad read would be lost for good.
+    fn load(project: &Project) -> Result<Book, Error> {
+        let text = match read(project, &file(project)?) {
+            Ok(text) => text,
+            Err(Error::NotFound(_)) => return Ok(Book::empty()),
+            Err(error) => return Err(error),
+        };
+        let mut book: Book = serde_json::from_str(&text).map_err(invalid)?;
+        if book.version != LAYOUT {
+            return Err(Error::Invalid(format!("{FILE}: layout {} is not one this plugin can read", book.version)));
+        }
+        // Keys are written with `/`; a hand-edited file may not be, and a note
+        // on `src\main.rs` would otherwise never meet the file it marks.
+        book.marks = book.marks.into_iter().map(|(rel, note)| (rel.replace('\\', "/"), note)).collect();
+        book.marks.retain(|_, note| !note.is_empty());
+        Ok(book)
+    }
+
+    fn empty() -> Book {
+        Book { version: LAYOUT, marks: BTreeMap::new() }
+    }
+
+    /// The note `path` carries, empty when it carries none.
+    fn remark(&self, project: &Project, path: &str) -> String {
+        self.marks.get(&rel_name(project, path)).cloned().unwrap_or_default()
+    }
+
+    /// Puts a note on a path, or takes it off: an empty note is a mark that was
+    /// removed, not one to draw. Whether anything changed comes back, because
+    /// clearing a file that carries no mark has nothing to say for itself.
+    fn put(&mut self, rel: &str, note: &str) -> bool {
+        if note.is_empty() {
+            self.marks.remove(rel).is_some()
+        } else {
+            self.marks.insert(rel.to_owned(), note.to_owned()).as_deref() != Some(note)
+        }
+    }
+
+    /// Writes the file, dropping the marks whose paths the project reports as
+    /// missing — the notes are pruned when the file is written for some reason
+    /// anyway, not on a look at the list.
+    fn save(&mut self, project: &Project) -> Result<(), Error> {
+        let root = project.root()?;
+        self.marks.retain(|rel, _| match stat(project, &join(&root, rel)) {
+            // Only "missing" is a deleted file; anything else keeps the note.
+            Err(Error::NotFound(_)) => false,
+            _ => true,
+        });
+        let mut text = serde_json::to_string_pretty(self).map_err(invalid)?;
+        text.push('\n');
+        project.write_file(&file(project)?, &text)
+    }
+}
+
+/// What a file this plugin cannot make of has to say, read or written.
+fn invalid(error: impl std::fmt::Display) -> Error {
+    Error::Invalid(format!("{FILE}: {error}"))
+}
+
 /// One listed mark: where it is, in which project, and what it says.
 struct Entry {
     /// The project's own name, for a row of it to say which project it is in.
@@ -205,36 +294,95 @@ struct Entry {
     remark: String,
 }
 
-/// This project's marks, in path order. A marked path that has stopped existing
-/// is forgotten here, so the tree and the list never show a dead entry.
-fn marks(project: &Project) -> Result<Vec<Entry>, Error> {
+/// This project's marks, in path order: what its file says, of the paths the
+/// project still has. A mark whose path the project reports as missing is left
+/// out here, so the tree and the list never show a dead entry, and `Book::save`
+/// drops it for good when the file is next written. Any other answer is a read
+/// that failed rather than a file that was deleted, so nothing is dropped and
+/// the failure is the answer instead: an entry let go on a stumble would be
+/// gone for good.
+fn live(project: &Project, book: &Book) -> Result<(Vec<Entry>, Option<Error>), Error> {
     let root = project.root()?;
-    let prefix = format!("{KEY_PREFIX}{root}:");
     let name = base_name(&root);
-    let mut live = Vec::new();
-    let mut gone = Vec::new();
-    for key in storage::keys(&prefix)? {
-        let Some(rel) = key.strip_prefix(&prefix).filter(|rel| !rel.is_empty()) else { continue };
-        let rel = rel.replace('\\', "/");
-        let full = join(&root, &rel);
+    let mut entries = Vec::new();
+    let mut trouble = None;
+    for (rel, remark) in &book.marks {
+        let path = join(&root, rel);
         // Project lookup, not `host::fs::*`: that is for paths outside projects.
-        match project.stat(&full) {
-            Ok(stat) => live.push(Entry {
+        match stat(project, &path) {
+            Ok(info) => entries.push(Entry {
                 project: name.clone(),
                 root: root.clone(),
-                remark: storage::get(&key)?.unwrap_or_default(),
-                path: full,
-                dir: stat.kind == FileKind::Directory,
-                rel,
+                remark: remark.clone(),
+                dir: info.kind == FileKind::Directory,
+                path,
+                rel: rel.clone(),
             }),
-            Err(_) => gone.push(key),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => {
+                if trouble.is_none() {
+                    trouble = Some(Error::Failed(format!("can't check the mark on {rel}: {error}")));
+                }
+            }
         }
     }
-    for key in gone {
-        let _ = storage::delete(&key);
+    entries.sort_by_key(|entry| entry.rel.to_lowercase());
+    Ok((entries, trouble))
+}
+
+/// A project's marks as its own file holds them.
+fn on_disk(project: &Project) -> Result<(Vec<Entry>, Option<Error>), Error> {
+    live(project, &Book::load(project)?)
+}
+
+fn marks(project: &Project) -> Result<Vec<Entry>, Error> {
+    let (entries, trouble) = on_disk(project)?;
+    trouble.map_or(Ok(entries), Err)
+}
+
+/// What the project says about `path`. Reads come through here so a test can
+/// hold one back: `MockHost` refuses a read for one reason only — the path is
+/// missing — and that is the one reason this plugin may forget a mark.
+fn stat(project: &Project, path: &str) -> Result<FileStat, Error> {
+    #[cfg(test)]
+    if held(path) {
+        return Err(Error::Failed("the project would not answer".into()));
     }
-    live.sort_by_key(|entry| entry.rel.to_lowercase());
-    Ok(live)
+    project.stat(path)
+}
+
+/// The text of a project file, held back the same way. What cannot be read is
+/// never written over, so the notes file has the most to lose from a stumble.
+fn read(project: &Project, path: &str) -> Result<String, Error> {
+    #[cfg(test)]
+    if let Some(text) = answered_stale(path) {
+        return Ok(text);
+    }
+    #[cfg(test)]
+    if held(path) {
+        return Err(Error::Failed("the project would not answer".into()));
+    }
+    project.read_file(path)
+}
+
+// Paths whose project reads are held back, by the test that holds one; a doc
+// comment would not survive the macro it hangs on.
+#[cfg(test)]
+thread_local! {
+    static HELD: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    // …and paths whose read is answered for a file that no longer says that,
+    // which is what a read made in the same pass as a write can do.
+    static STALE: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+fn held(path: &str) -> bool {
+    HELD.with(|held| held.borrow().contains(path))
+}
+
+#[cfg(test)]
+fn answered_stale(path: &str) -> Option<String> {
+    STALE.with(|stale| stale.borrow().get(path).cloned())
 }
 
 /// Every mark of every open project, grouped by project and then in path order.
@@ -247,17 +395,52 @@ fn listed() -> Result<Vec<Entry>, Error> {
     Ok(all)
 }
 
-/// Re-applies every mark of every open project.
+/// Re-applies every mark of every open project, read from the files that hold them.
 fn refresh() -> Result<(), Error> {
+    redraw(None)
+}
+
+/// Re-applies every mark, taking the notes of `written` — the project just
+/// written to, from the book that was put in its file — from memory. A read
+/// made in the same pass as a write answers for the file as it was before the
+/// write, and a tree drawn from that answer shows the note one operation late.
+fn redraw(written: Option<(&Project, &Book)>) -> Result<(), Error> {
     // Clearing takes the set out of every project at once, so every project has
     // to be re-applied in the same pass — one alone would hide the others.
     host::clear_file_decorations(SET)?;
+    let mut trouble = None;
     for project in host::projects()? {
-        for entry in marks(&project)? {
-            apply(&entry);
+        let read = match written {
+            Some((here, book)) if holds_the_same_project(here, &project) => live(&project, book),
+            _ => on_disk(&project),
+        };
+        match read {
+            Ok((entries, stalled)) => {
+                for entry in entries {
+                    apply(&entry);
+                }
+                if trouble.is_none() {
+                    trouble = stalled;
+                }
+            }
+            // A window whose project will not answer says so, but not at the
+            // cost of the other windows' marks.
+            Err(error) => {
+                if trouble.is_none() {
+                    trouble = Some(error);
+                }
+            }
         }
     }
-    Ok(())
+    trouble.map_or(Ok(()), Err)
+}
+
+/// Whether both handle the same root.
+fn holds_the_same_project(here: &Project, other: &Project) -> bool {
+    match (here.root(), other.root()) {
+        (Ok(here), Ok(other)) => here == other,
+        _ => false,
+    }
 }
 
 /// Puts one mark back on the tree. An empty remark has nothing to draw, which is
@@ -345,22 +528,6 @@ impl Rows<'_> {
     }
 }
 
-/// The remark a path carries, empty when it carries none.
-fn remark(project: &Project, path: &str) -> Result<String, Error> {
-    Ok(storage::get(&storage_key(project, path)?)?.unwrap_or_default())
-}
-
-/// Keeps a remark, or forgets the record entirely when it says nothing: an empty
-/// value is a mark that was taken off, not one to draw.
-fn save(project: &Project, path: &str, remark: &str) -> Result<(), Error> {
-    let key = storage_key(project, path)?;
-    if remark.is_empty() {
-        storage::delete(&key)
-    } else {
-        storage::set(&key, remark)
-    }
-}
-
 /// The paths the call names, in the project they belong to: the tool-window row
 /// that asked (`arg`), else the tree selection, else the open file. A row can
 /// name a path the invoking window's own project does not hold.
@@ -389,12 +556,10 @@ fn named(project: &Project, paths: &[String]) -> String {
     }
 }
 
-fn storage_key(project: &Project, path: &str) -> Result<String, Error> {
-    Ok(format!("{}{}", prefix(project)?, rel_name(project, path)))
-}
-
-fn prefix(project: &Project) -> Result<String, Error> {
-    Ok(format!("{KEY_PREFIX}{}:", project.root()?))
+/// The file a project keeps its notes in: its own root, so the notes belong to
+/// the code they describe.
+fn file(project: &Project) -> Result<String, Error> {
+    Ok(join(&project.root()?, FILE))
 }
 
 /// Whether `path` is a folder, as the tree of its own project draws it.
@@ -449,7 +614,65 @@ mod tests {
     use super::*;
     use openidea_plugin::mock::MockHost;
 
-    const FILE: &str = "/project/src/main.rs";
+    const MAIN: &str = "/project/src/main.rs";
+
+    /// The mock, with the one grant `install` does not hand out and this plugin
+    /// needs: writing its file. What is missing from the list matters as much —
+    /// `storage` is not there, so a plugin still asking for it would fail here.
+    fn install() -> MockHost {
+        MockHost::install().with_capabilities(&[
+            "ide.commands",
+            "project.read",
+            "project.write",
+            "editor.read",
+            "editor.write",
+            "vcs.read",
+            "vcs.write",
+            "build.read",
+            "events",
+            "events.input",
+            "clipboard",
+        ])
+    }
+
+    /// The project that mock says is open.
+    fn project(root: &str) -> Project {
+        host::projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.root().unwrap() == root)
+            .unwrap_or_else(|| panic!("no project at {root}"))
+    }
+
+    /// The notes file of a project, as it stands: read past the plugin, since
+    /// what a test holds back is often the plugin's own read.
+    fn notes(root: &str) -> Option<String> {
+        project(root).read_file(&format!("{root}/{FILE}")).ok()
+    }
+
+    /// The note the file keeps on `rel`.
+    fn kept(root: &str, rel: &str) -> Option<String> {
+        let text = notes(root)?;
+        serde_json::from_str::<Book>(&text).ok()?.marks.get(rel).cloned()
+    }
+
+    /// What another window would have left behind: the project's file, holding
+    /// these marks. Seeded rather than typed, because the mock keeps a written
+    /// file under its root-relative name, which two projects would share.
+    fn seed(host: &MockHost, root: &str, marks: &[(&str, &str)]) {
+        host.add_file(&format!("{root}/{FILE}"), &text(marks));
+    }
+
+    /// The notes file as this plugin writes it with these marks.
+    fn text(marks: &[(&str, &str)]) -> String {
+        let book = Book {
+            version: LAYOUT,
+            marks: marks.iter().map(|(rel, note)| ((*rel).to_owned(), (*note).to_owned())).collect(),
+        };
+        let mut text = serde_json::to_string_pretty(&book).unwrap();
+        text.push('\n');
+        text
+    }
 
     /// The paths the installed host has open, as the editor would show them.
     fn open_paths() -> Vec<String> {
@@ -473,22 +696,27 @@ mod tests {
     }
 
     #[test]
-    fn a_remark_reaches_the_tree_and_is_kept() {
-        let host = MockHost::install();
-        host.add_file(FILE, "fn main() {}\n");
-        host.select_paths(&[FILE]);
+    fn a_remark_reaches_the_tree_and_is_kept_in_the_project() {
+        let host = install();
+        host.add_file(MAIN, "fn main() {}\n");
+        host.select_paths(&[MAIN]);
         let mut plugin = FileMarks::default();
 
         host.answer_next_prompt(Some(&["the entry point"]));
         let out = plugin.run_command("add-remark", &host.invocation(), None).unwrap();
         assert_eq!(out.as_deref(), Some("Remark on src/main.rs: the entry point"));
-        assert_eq!(remark(&host, FILE).as_deref(), Some("the entry point"));
-        assert_eq!(host.storage()[&format!("{KEY_PREFIX}/project:src/main.rs")], "the entry point");
+        assert_eq!(remark(&host, MAIN).as_deref(), Some("the entry point"));
+        // The whole file, because it sits in the project for anyone to read:
+        // one note per line, the path as the project sees it, sorted.
+        assert_eq!(
+            notes("/project").as_deref(),
+            Some("{\n  \"version\": 1,\n  \"marks\": {\n    \"src/main.rs\": \"the entry point\"\n  }\n}\n")
+        );
     }
 
     #[test]
     fn one_remark_answers_for_every_selected_file() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/project/a.rs", "x");
         host.add_file("/project/b.rs", "x");
         host.select_paths(&["/project/a.rs", "/project/b.rs"]);
@@ -500,57 +728,65 @@ mod tests {
         for path in ["/project/a.rs", "/project/b.rs"] {
             assert_eq!(remark(&host, path).as_deref(), Some("work in progress"));
         }
+        for rel in ["a.rs", "b.rs"] {
+            assert_eq!(kept("/project", rel).as_deref(), Some("work in progress"), "{rel} is in the file too");
+        }
     }
 
     #[test]
     fn emptying_the_box_is_how_a_remark_comes_off() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         let mut plugin = FileMarks::default();
-        host.select_paths(&[FILE]);
+        host.select_paths(&[MAIN]);
         host.answer_next_prompt(Some(&["keep out"]));
         plugin.run_command("add-remark", &host.invocation(), None).unwrap();
 
         host.answer_next_prompt(Some(&[""]));
         let out = plugin.run_command("add-remark", &host.invocation(), None).unwrap();
         assert_eq!(out.as_deref(), Some("Took the remark off src/main.rs."));
-        assert_eq!(remark(&host, FILE), None);
-        assert!(host.storage().is_empty(), "a mark that says nothing is not kept");
+        assert_eq!(remark(&host, MAIN), None);
+        assert_eq!(kept("/project", "src/main.rs"), None, "a note that says nothing is not kept");
+        // The file itself stays, empty: taking the last note off is not the
+        // plugin's business in someone else's project tree.
+        assert_eq!(notes("/project").as_deref(), Some("{\n  \"version\": 1,\n  \"marks\": {}\n}\n"));
     }
 
     #[test]
     fn clearing_takes_the_mark_off() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         let mut plugin = FileMarks::default();
-        host.select_paths(&[FILE]);
+        host.select_paths(&[MAIN]);
         host.answer_next_prompt(Some(&["mine"]));
         plugin.run_command("add-remark", &host.invocation(), None).unwrap();
 
         let out = plugin.run_command("clear-mark", &host.invocation(), None).unwrap();
         assert_eq!(out.as_deref(), Some("Cleared 1 mark from src/main.rs."));
-        assert!(host.storage().is_empty(), "an empty mark is not stored");
-        assert_eq!(remark(&host, FILE), None);
+        assert_eq!(kept("/project", "src/main.rs"), None);
+        assert_eq!(remark(&host, MAIN), None);
 
+        let before = notes("/project");
         let out = plugin.run_command("clear-mark", &host.invocation(), None).unwrap();
         assert_eq!(out.as_deref(), Some("src/main.rs carries no mark."));
+        assert_eq!(notes("/project"), before, "nothing to take off leaves the file as it was");
     }
 
     #[test]
     fn a_remark_too_long_to_draw_is_refused_before_it_is_kept() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
-        host.select_paths(&[FILE]);
+        let host = install();
+        host.add_file(MAIN, "x");
+        host.select_paths(&[MAIN]);
         let too_long = "x".repeat(MAX_REMARK + 1);
         host.answer_next_prompt(Some(&[too_long.as_str()]));
         let error = FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap_err();
         assert!(matches!(error, Error::Invalid(_)), "{error:?}");
-        assert!(host.storage().is_empty());
+        assert_eq!(notes("/project"), None, "a refused note does not add a file to the project");
     }
 
     #[test]
     fn a_command_needs_something_to_mark() {
-        let host = MockHost::install();
+        let host = install();
         for command in ["add-remark", "clear-mark"] {
             let error = FileMarks::default().run_command(command, &host.invocation(), None).unwrap_err();
             assert_eq!(error.to_string(), "select a file or folder first");
@@ -559,42 +795,211 @@ mod tests {
 
     #[test]
     fn restarting_reapplies_the_marks_of_every_open_project() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         host.add_file("/other/b.rs", "x");
         host.add_project("/other");
-        host.select_paths(&[FILE]);
-        host.answer_next_prompt(Some(&["one"]));
-        FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap();
-        // The other window's mark as that window would have saved it: the mock
-        // draws a tree path only in the one project an invocation is rooted in.
-        storage::set(&format!("{KEY_PREFIX}/other:b.rs"), "two").unwrap();
+        // Each project's own file, as the window that wrote it left it.
+        seed(&host, "/project", &[("src/main.rs", "one")]);
+        seed(&host, "/other", &[("b.rs", "two")]);
 
         FileMarks::default().activate(&Context::default()).unwrap();
-        assert_eq!(remark(&host, FILE).as_deref(), Some("one"));
+        assert_eq!(remark(&host, MAIN).as_deref(), Some("one"));
+        assert_eq!(kept("/project", "src/main.rs").as_deref(), Some("one"), "listing the marks never rewrites them");
 
+        // The other window's file is read in the same pass; the mock only draws
+        // a tree path in the project an invocation is rooted in, so that half
+        // waits for the root to move.
         host.set_project_root(Some("/other"));
         FileMarks::default().activate(&Context::default()).unwrap();
         assert_eq!(remark(&host, "/other/b.rs").as_deref(), Some("two"));
-        assert_eq!(host.storage().len(), 2, "neither project's mark was taken for a dead one");
+        assert_eq!(kept("/other", "b.rs").as_deref(), Some("two"), "and neither file was touched here either");
     }
 
+    /// A mark on a path that is gone has to leave, but the notes are a file the
+    /// user owns now: looking at it is no reason to write it.
     #[test]
-    fn a_deleted_file_forgot_its_mark() {
-        let host = MockHost::install();
-        storage::set(&format!("{KEY_PREFIX}/project:gone.rs"), "bye").unwrap();
+    fn a_deleted_file_loses_its_mark_when_the_file_is_written_again() {
+        let host = install();
+        host.add_file(MAIN, "x");
+        seed(&host, "/project", &[("gone.rs", "bye"), ("src/main.rs", "kept")]);
+
         FileMarks::default().activate(&Context::default()).unwrap();
-        assert!(host.storage().is_empty(), "the dead record is dropped");
-        assert!(host.file_notes().is_empty());
+        assert_eq!(remark(&host, "/project/gone.rs"), None, "a dead path is not drawn");
+        assert_eq!(remark(&host, MAIN).as_deref(), Some("kept"));
+        assert_eq!(kept("/project", "gone.rs").as_deref(), Some("bye"), "and a look writes nothing");
+
+        host.select_paths(&[MAIN]);
+        host.answer_next_prompt(Some(&["kept"]));
+        FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap();
+        assert_eq!(kept("/project", "gone.rs"), None, "the dead note goes with the next write");
+        assert_eq!(kept("/project", "src/main.rs").as_deref(), Some("kept"));
+    }
+
+    /// A project that will not answer for a path — a busy disk, a read refused,
+    /// an index not ready — has said nothing about the file being gone. Losing
+    /// the note there would be losing it for good, on a moment's trouble.
+    #[test]
+    fn a_read_that_stumbles_keeps_the_mark_and_says_so() {
+        let host = install();
+        host.add_file(MAIN, "x");
+        host.select_paths(&[MAIN]);
+        host.answer_next_prompt(Some(&["keep out"]));
+        let mut plugin = FileMarks::default();
+        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
+        let before = notes("/project");
+
+        hold(MAIN);
+        let error = plugin.render(VIEW, None, &host.invocation()).unwrap_err();
+        assert_eq!(error.to_string(), "can't check the mark on src/main.rs: the project would not answer");
+        // Rebuilding the tree reports the same failure rather than drawing an
+        // empty set and calling the marks gone.
+        let error = FileMarks::default().activate(&Context::default()).unwrap_err();
+        assert!(matches!(error, Error::Failed(_)), "{error:?}");
+        assert!(host.file_notes().is_empty(), "nothing is drawn from a mark it could not check");
+        assert_eq!(notes("/project"), before, "a stumble writes nothing over the notes");
+
+        release(MAIN);
+        show_flat(&mut plugin, &host);
+        let view = plugin.render(VIEW, None, &host.invocation()).unwrap();
+        assert_eq!(view.status.as_deref(), Some("1 mark"));
+        assert_eq!(rows(&view).len(), 1, "the mark is back in the list once the project answers");
+        FileMarks::default().activate(&Context::default()).unwrap();
+        assert_eq!(remark(&host, MAIN).as_deref(), Some("keep out"), "so it goes back on the tree");
+    }
+
+    /// What a write just put in the file goes on the tree from what it wrote,
+    /// not from reading the file back: a read answered for the older content
+    /// would put every remark one operation behind, showing up only when the
+    /// next one is written.
+    #[test]
+    fn a_new_remark_is_drawn_from_the_write_that_made_it() {
+        let host = install();
+        let notes = format!("/project/{FILE}");
+        host.add_file(MAIN, "fn main() {}\n");
+        host.select_paths(&[MAIN]);
+        let mut plugin = FileMarks::default();
+
+        answered_for(&notes, &text(&[]));
+        host.answer_next_prompt(Some(&["the entry point"]));
+        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
+        stop_answering_for(&notes);
+
+        assert_eq!(remark(&host, MAIN).as_deref(), Some("the entry point"), "the name carries it at once");
+        assert_eq!(kept("/project", "src/main.rs").as_deref(), Some("the entry point"));
+    }
+
+    /// The same the other way: a mark taken off leaves the tree on the pass
+    /// that took it off, rather than waiting for the next write to notice.
+    #[test]
+    fn a_cleared_remark_leaves_the_tree_on_the_pass_that_cleared_it() {
+        let host = install();
+        let file = format!("/project/{FILE}");
+        host.add_file(MAIN, "x");
+        seed(&host, "/project", &[("src/main.rs", "keep out")]);
+        let as_it_stands = notes("/project").unwrap();
+        host.select_paths(&[MAIN]);
+        let mut plugin = FileMarks::default();
+
+        answered_for(&file, &as_it_stands);
+        plugin.run_command("clear-mark", &host.invocation(), None).unwrap();
+        stop_answering_for(&file);
+
+        assert_eq!(remark(&host, MAIN), None, "an answer for the file before the write would redraw it");
+        assert_eq!(kept("/project", "src/main.rs"), None);
+    }
+
+    /// The prune on a write is only for paths the project says are gone; one it
+    /// cannot check keeps its note through the same write.
+    #[test]
+    fn a_write_keeps_what_the_project_cannot_check() {
+        let host = install();
+        host.add_file(MAIN, "x");
+        host.add_file("/project/a.rs", "x");
+        seed(&host, "/project", &[("src/main.rs", "keep out"), ("a.rs", "settled")]);
+
+        hold(MAIN);
+        host.select_paths(&["/project/a.rs"]);
+        host.answer_next_prompt(Some(&["settled, still"]));
+        // The write happens before the tree is redrawn, so what fails here is
+        // the drawing, and the notes are already safe on disk.
+        let error = FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap_err();
+        assert!(matches!(error, Error::Failed(_)), "{error:?}");
+        release(MAIN);
+
+        assert_eq!(kept("/project", "src/main.rs").as_deref(), Some("keep out"), "unconfirmed is not deleted");
+        assert_eq!(kept("/project", "a.rs").as_deref(), Some("settled, still"));
+    }
+
+    /// One file holds the notes now, so one read that fails is the whole set
+    /// failing — and the one thing a write must never do is answer it.
+    #[test]
+    fn notes_that_cannot_be_read_are_never_written_over() {
+        let host = install();
+        host.add_file(MAIN, "x");
+        seed(&host, "/project", &[("src/main.rs", "keep out")]);
+        let before = notes("/project");
+        let file = format!("/project/{FILE}");
+
+        hold(&file);
+        host.select_paths(&[MAIN]);
+        // No answer is queued, so were the box to open the note would come back
+        // as a cancelled prompt: the file is read, and the failure reported,
+        // before anything is asked of the user.
+        let error = FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap_err();
+        assert!(matches!(error, Error::Failed(_)), "{error:?}");
+        assert!(FileMarks::default().activate(&Context::default()).is_err(), "and the window says so too");
+
+        release(&file);
+        assert_eq!(notes("/project"), before, "every note is where it was");
+        assert_eq!(kept("/project", "src/main.rs").as_deref(), Some("keep out"));
+    }
+
+    /// A file this plugin cannot make sense of is not a file to replace: it may
+    /// be a newer one, or one the user was part way through editing.
+    #[test]
+    fn a_file_that_is_not_understood_is_refused_not_replaced() {
+        let host = install();
+        host.add_file(MAIN, "x");
+        host.add_file(&format!("/project/{FILE}"), "{\n  \"version\": 2,\n  \"marks\": {\n    \"src/main.rs\": \"newer\"\n  }\n}\n");
+        host.select_paths(&[MAIN]);
+        let error = FileMarks::default().run_command("add-remark", &host.invocation(), None).unwrap_err();
+        assert_eq!(error.to_string(), "invalid: file-mark.json: layout 2 is not one this plugin can read");
+        assert!(notes("/project").unwrap().contains("\"version\": 2"), "the newer file is left for a newer plugin");
+
+        host.add_file(&format!("/project/{FILE}"), "{ this is not the shape");
+        let error = FileMarks::default().run_command("clear-mark", &host.invocation(), None).unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)), "{error:?}");
+        assert_eq!(notes("/project").as_deref(), Some("{ this is not the shape"), "nor is a half-edited one");
+    }
+
+    /// Holds a project's read of `path` back, which is the one answer the mock
+    /// has no way to give on its own.
+    fn hold(path: &str) {
+        HELD.with(|held| held.borrow_mut().insert(path.to_owned()));
+    }
+
+    fn release(path: &str) {
+        HELD.with(|held| held.borrow_mut().remove(path));
+    }
+
+    /// A read of `path` answered with `text`, however the file stands now —
+    /// which is what a read made in the same pass as a write can hand back.
+    fn answered_for(path: &str, text: &str) {
+        STALE.with(|stale| stale.borrow_mut().insert(path.to_owned(), text.to_owned()));
+    }
+
+    fn stop_answering_for(path: &str) {
+        STALE.with(|stale| stale.borrow_mut().remove(path));
     }
 
     #[test]
     fn the_flat_list_puts_the_note_before_the_place() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         host.add_dir("/project/docs");
         let mut plugin = FileMarks::default();
-        for (path, text) in [(FILE, "keep out"), ("/project/docs", "hand me in")] {
+        for (path, text) in [(MAIN, "keep out"), ("/project/docs", "hand me in")] {
             host.select_paths(&[path]);
             host.answer_next_prompt(Some(&[text]));
             plugin.run_command("add-remark", &host.invocation(), None).unwrap();
@@ -617,16 +1022,13 @@ mod tests {
 
     #[test]
     fn a_flat_list_of_several_projects_says_which_project_each_place_is_in() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         host.add_file("/other/b.rs", "x");
         host.add_project("/other");
+        seed(&host, "/project", &[("src/main.rs", "mine")]);
+        seed(&host, "/other", &[("b.rs", "theirs")]);
         let mut plugin = FileMarks::default();
-        host.select_paths(&[FILE]);
-        host.answer_next_prompt(Some(&["mine"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
-        // The other window's mark as that window would have saved it.
-        storage::set(&format!("{KEY_PREFIX}/other:b.rs"), "theirs").unwrap();
         show_flat(&mut plugin, &host);
 
         let items = rows(&plugin.render(VIEW, None, &host.invocation()).unwrap());
@@ -639,15 +1041,11 @@ mod tests {
 
     #[test]
     fn the_tree_shows_the_folders_a_mark_sits_in() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/project/src/app/main.rs", "x");
         host.add_file("/project/src/lib.rs", "x");
+        seed(&host, "/project", &[("src/app/main.rs", "the entry"), ("src/lib.rs", "mine")]);
         let mut plugin = FileMarks::default();
-        for (path, text) in [("/project/src/app/main.rs", "the entry"), ("/project/src/lib.rs", "mine")] {
-            host.select_paths(&[path]);
-            host.answer_next_prompt(Some(&[text]));
-            plugin.run_command("add-remark", &host.invocation(), None).unwrap();
-        }
 
         let items = rows(&plugin.render(VIEW, None, &host.invocation()).unwrap());
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
@@ -668,12 +1066,10 @@ mod tests {
 
     #[test]
     fn a_closed_folder_stays_closed_and_its_marks_are_listed_when_opened() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
+        seed(&host, "/project", &[("src/main.rs", "keep out")]);
         let mut plugin = FileMarks::default();
-        host.select_paths(&[FILE]);
-        host.answer_next_prompt(Some(&["keep out"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
         let src = view_key(DIR, "/project/src");
 
         plugin.handle(VIEW, ViewEvent::Collapse(src.clone()), &host.invocation()).unwrap();
@@ -688,15 +1084,11 @@ mod tests {
 
     #[test]
     fn the_filter_narrows_the_list_and_says_by_how_much() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/project/a.rs", "x");
         host.add_file("/project/b.rs", "x");
+        seed(&host, "/project", &[("a.rs", "keep out"), ("b.rs", "settled")]);
         let mut plugin = FileMarks::default();
-        for (path, text) in [("/project/a.rs", "keep out"), ("/project/b.rs", "settled")] {
-            host.select_paths(&[path]);
-            host.answer_next_prompt(Some(&[text]));
-            plugin.run_command("add-remark", &host.invocation(), None).unwrap();
-        }
         show_flat(&mut plugin, &host);
 
         // The word matches a remark or a path.
@@ -737,12 +1129,10 @@ mod tests {
 
     #[test]
     fn a_filter_matching_nothing_keeps_its_toolbar() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/project/a.rs", "x");
+        seed(&host, "/project", &[("a.rs", "keep out")]);
         let mut plugin = FileMarks::default();
-        host.select_paths(&["/project/a.rs"]);
-        host.answer_next_prompt(Some(&["keep out"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
 
         host.answer_next_prompt(Some(&["no such word"]));
         plugin.handle(VIEW, ViewEvent::Button(BTN_FILTER.into()), &host.invocation()).unwrap();
@@ -755,12 +1145,10 @@ mod tests {
 
     #[test]
     fn escaping_the_filter_leaves_it_alone() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/project/a.rs", "x");
+        seed(&host, "/project", &[("a.rs", "keep out")]);
         let mut plugin = FileMarks::default();
-        host.select_paths(&["/project/a.rs"]);
-        host.answer_next_prompt(Some(&["keep out"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
         show_flat(&mut plugin, &host);
 
         host.answer_next_prompt(Some(&["keep"]));
@@ -777,12 +1165,10 @@ mod tests {
 
     #[test]
     fn the_mode_button_switches_between_the_two_lists() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
+        seed(&host, "/project", &[("src/main.rs", "keep out")]);
         let mut plugin = FileMarks::default();
-        host.select_paths(&[FILE]);
-        host.answer_next_prompt(Some(&["keep out"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
 
         // Tree first: the mark hangs under its folders.
         let items = rows(&plugin.render(VIEW, None, &host.invocation()).unwrap());
@@ -797,47 +1183,40 @@ mod tests {
 
     #[test]
     fn a_row_opens_its_file_and_a_folder_row_walks_instead() {
-        let host = MockHost::install();
-        host.add_file(FILE, "x");
+        let host = install();
+        host.add_file(MAIN, "x");
         host.add_dir("/project/docs");
+        seed(&host, "/project", &[("docs", "keep out"), ("src/main.rs", "keep out")]);
         let mut plugin = FileMarks::default();
-        for path in [FILE, "/project/docs"] {
-            host.select_paths(&[path]);
-            host.answer_next_prompt(Some(&["keep out"]));
-            plugin.run_command("add-remark", &host.invocation(), None).unwrap();
-        }
 
         plugin.handle(VIEW, ViewEvent::Activate(view_key(DIR, "/project/src")), &host.invocation()).unwrap();
         assert!(open_paths().is_empty(), "a folder shown for structure opens nothing");
         plugin.handle(VIEW, ViewEvent::Activate(view_key(MARK, "/project/docs")), &host.invocation()).unwrap();
         assert!(open_paths().is_empty(), "a marked folder has no editor either");
 
-        plugin.handle(VIEW, ViewEvent::Activate(view_key(MARK, FILE)), &host.invocation()).unwrap();
-        assert_eq!(open_paths(), [FILE]);
+        plugin.handle(VIEW, ViewEvent::Activate(view_key(MARK, MAIN)), &host.invocation()).unwrap();
+        assert_eq!(open_paths(), [MAIN]);
     }
 
     #[test]
     fn a_row_of_another_project_is_cleared_in_its_own() {
-        let host = MockHost::install();
+        let host = install();
         host.add_file("/other/b.rs", "x");
         host.add_project("/other");
         host.set_project_root(Some("/other"));
-        host.select_paths(&["/other/b.rs"]);
-        let mut plugin = FileMarks::default();
-        host.answer_next_prompt(Some(&["theirs"]));
-        plugin.run_command("add-remark", &host.invocation(), None).unwrap();
+        seed(&host, "/other", &[("b.rs", "theirs")]);
 
         // The tool window lists every project, so a row names its own.
         let mut plugin = FileMarks::default();
         let out = plugin.run_command("clear-mark", &host.invocation(), Some(&view_key(MARK, "/other/b.rs"))).unwrap();
         assert_eq!(out.as_deref(), Some("Cleared 1 mark from b.rs."));
-        assert!(host.storage().is_empty());
+        assert_eq!(kept("/other", "b.rs"), None);
         assert_eq!(remark(&host, "/other/b.rs"), None);
     }
 
     #[test]
     fn another_view_or_command_is_not_ours() {
-        let host = MockHost::install();
+        let host = install();
         let mut plugin = FileMarks::default();
         assert!(matches!(plugin.render("something-else", None, &host.invocation()), Err(Error::NotFound(_))));
         assert!(matches!(

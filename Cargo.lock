@@ -105,9 +105,11 @@ dependencies = [
 
 [[package]]
 name = "openidea-plugin-openidea-file-marks"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "openidea-plugin",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
